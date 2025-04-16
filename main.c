@@ -19,6 +19,10 @@
 
 #define CLEAR_WIDTH_MULTIPLIER 1.5f
 
+// Key animation parameters
+#define KEY_ANIMATION_DURATION 0.5f  // Duration of key animation in seconds
+#define KEYBOARD_WIDTH 20
+
 typedef struct {
     uint8_t note;
     uint8_t velocity;
@@ -31,8 +35,11 @@ typedef struct {
     bool isActive;
     uint8_t velocity;
     double startTime;
-    float startX;     // The X position where this note started
-    bool needsDrawing; // Flag to indicate if this note needs initial drawing
+    float startX;   
+    bool needsDrawing; 
+    double keyPressTime;
+    double keyReleaseTime;
+    bool keyIsPressed;    
 } ActiveNote;
 
 typedef struct {
@@ -74,6 +81,9 @@ static void init_event_queue() {
             activeNotes[c][n].startTime = 0.0;
             activeNotes[c][n].startX = 0.0f;
             activeNotes[c][n].needsDrawing = false;
+            activeNotes[c][n].keyPressTime = 0.0;
+            activeNotes[c][n].keyReleaseTime = 0.0;
+            activeNotes[c][n].keyIsPressed = false;
         }
     }
 }
@@ -103,6 +113,10 @@ inline __attribute__((always_inline)) static bool queue_pop(MidiEvent* event) {
     return success;
 }
 
+inline __attribute__((always_inline)) static float get_note_y_piano(const uint8_t note) {
+    return (screenHeight - ((float)(note + 1) / MAX_KEYS) * screenHeight) + NOTE_HEIGHT + 1;
+}
+
 inline __attribute__((always_inline)) static float get_note_y(const uint8_t note) {
     return ((float)(note + 1) / MAX_KEYS) * screenHeight;
 }
@@ -113,6 +127,24 @@ inline __attribute__((always_inline)) static Color get_note_color(uint8_t channe
         PURPLE, MAGENTA, MAROON, BROWN, PINK, DARKGRAY, RAYWHITE, WHITE
     };
     return channelColors[channel % MAX_CHANNELS];
+}
+
+// Get an animation alpha value based on press/release time
+inline __attribute__((always_inline)) static float get_key_animation_alpha(double pressTime, double releaseTime, bool isPressed, double currentTime) {
+    float alpha = 0.0f;
+
+    if (isPressed) {
+        // Key is currently pressed - full brightness
+        alpha = 1.0f;
+    } else if (releaseTime > 0.0) {
+        // Key was recently released - fade out
+        float timeSinceRelease = currentTime - releaseTime;
+        if (timeSinceRelease < KEY_ANIMATION_DURATION) {
+            alpha = 1.0f - (timeSinceRelease / KEY_ANIMATION_DURATION);
+        }
+    }
+
+    return alpha;
 }
 
 inline __attribute__((always_inline)) static void note_on(uint8_t channel, const uint8_t note, const uint8_t velocity) {
@@ -128,6 +160,8 @@ inline __attribute__((always_inline)) static void note_on(uint8_t channel, const
     activeNotes[channel][note].velocity = velocity;
     activeNotes[channel][note].startTime = event.timestamp;
     activeNotes[channel][note].needsDrawing = true;  // Mark that this note needs initial drawing
+    activeNotes[channel][note].keyPressTime = event.timestamp;
+    activeNotes[channel][note].keyIsPressed = true;
 
     queue_push(event);
     textureNeedsUpdate = true;
@@ -144,6 +178,8 @@ inline __attribute__((always_inline)) static void note_off(uint8_t channel, cons
 
     activeNotes[channel][note].isActive = false;
     activeNotes[channel][note].needsDrawing = false;
+    activeNotes[channel][note].keyReleaseTime = event.timestamp;
+    activeNotes[channel][note].keyIsPressed = false;
 
     queue_push(event);
     textureNeedsUpdate = true;
@@ -249,7 +285,7 @@ inline __attribute__((always_inline)) static void update_texture() {
 
         if (event.isNoteOn) {
             activeNotes[event.channel][event.note].startX = currentRightEdge;
-            activeNotes[event.channel][event.note].needsDrawing = false; // We're handling it now
+            activeNotes[event.channel][event.note].needsDrawing = false;
         } else {
             float startX = activeNotes[event.channel][event.note].startX;
 
@@ -283,6 +319,75 @@ inline __attribute__((always_inline)) static void update_texture() {
     textureNeedsUpdate = false;
 }
 
+// Draw the piano keyboard with animations for pressed keys
+static void draw_animated_keyboard() {
+    const int keyboardWidth = KEYBOARD_WIDTH;
+    DrawRectangle(screenWidth - keyboardWidth, 0, keyboardWidth, screenHeight, DARKGRAY);
+
+    for (int note = 0; note < MAX_KEYS; note++) {
+        int noteType = note % 12;
+        float y = get_note_y_piano(note);
+        bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
+
+        // Check if any channel has this note active (for animation)
+        float maxAlpha = 0.0f;
+        int activeChannel = -1;
+
+        for (int c = 0; c < MAX_CHANNELS; c++) {
+            float alpha = get_key_animation_alpha(
+                activeNotes[c][note].keyPressTime,
+                activeNotes[c][note].keyReleaseTime,
+                activeNotes[c][note].keyIsPressed,
+                globalTime
+            );
+
+            if (alpha > maxAlpha) {
+                maxAlpha = alpha;
+                activeChannel = c;
+            }
+        }
+
+        // If key is active or recently released, draw an animation overlay
+        if (maxAlpha > 0.0f && activeChannel >= 0) {
+            Color keyColor = get_note_color(activeChannel);
+
+            // Modify alpha of the key color
+            keyColor.a = 255 * maxAlpha;
+
+            DrawRectangle(
+                screenWidth - keyboardWidth,
+                y - NOTE_HEIGHT,
+                keyboardWidth,
+                NOTE_HEIGHT,
+                ColorAlpha(keyColor, 0.7f * maxAlpha)
+            );
+        }
+
+        // Draw black key overlay after white key animation
+        if (isBlackKey) {
+            // Make sure black keys are always drawn on top with their base color
+            DrawRectangle(screenWidth - keyboardWidth / 2, y - NOTE_HEIGHT, keyboardWidth / 2, NOTE_HEIGHT, BLACK);
+
+            // If the black key is active, add the animation on top
+            if (maxAlpha > 0.0f && activeChannel >= 0) {
+                Color keyColor = get_note_color(activeChannel);
+                DrawRectangle(
+                    screenWidth - keyboardWidth / 2,
+                    y - NOTE_HEIGHT,
+                    keyboardWidth / 2,
+                    NOTE_HEIGHT,
+                    ColorAlpha(keyColor, 0.8f * maxAlpha)
+                );
+            }
+        }
+
+        // Draw C note labels
+        if (noteType == 0) {
+            DrawText(TextFormat("C%d", note / 12 - 1), screenWidth - keyboardWidth + 2, y - NOTE_HEIGHT - 8, 10, GRAY);
+        }
+    }
+}
+
 static void* midi_thread(void* arg) {
     char* midiPath = (char*)arg;
     timeOffset = GetTime();
@@ -297,7 +402,7 @@ int main(const int argc, char* argv[]) {
     }
 
     init_event_queue();
-    InitWindow(screenWidth, screenHeight, "Refined MIDI Piano Roll");
+    InitWindow(screenWidth, screenHeight, "Piano Roll Thingy");
     SetTargetFPS(144);
 
     // Create a persistent scroll texture
@@ -349,21 +454,10 @@ int main(const int argc, char* argv[]) {
             DrawLine(0, y, screenWidth, y, lineColor);
         }
 
-        // Draw the piano keyboard on the side
-        const int keyboardWidth = 40;
-        DrawRectangle(screenWidth - keyboardWidth, 0, keyboardWidth, screenHeight, DARKGRAY);
-        for (int note = 0; note < MAX_KEYS; note++) {
-            int noteType = note % 12;
-            float y = get_note_y(note);
-            bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
-            if (isBlackKey) {
-                DrawRectangle(screenWidth - keyboardWidth / 2, y - NOTE_HEIGHT, keyboardWidth / 2, NOTE_HEIGHT, BLACK);
-            }
-            if (noteType == 0) {
-                DrawText(TextFormat("C%d", note / 12 - 1), screenWidth - keyboardWidth + 2, y - NOTE_HEIGHT - 8, 10, GRAY);
-            }
-        }
+        // Draw the animated piano keyboard
+        draw_animated_keyboard();
 
+        DrawRectangle(5, 5, 300, 60, (Color){ 0, 0, 0, 160 }); // semi-transparent black background
         DrawFPS(10, 10);
         DrawText(TextFormat("Notes per second: %lu", notesPerSecond), 10, 30, 20, WHITE);
         EndDrawing();
