@@ -176,16 +176,22 @@ void free_track_data(TrackData* track) {
     track->long_msg = NULL;
 }
 
-typedef void (*NoteOnCallback)(uint8_t velocity, uint8_t channel, uint8_t note);
+typedef void (*NoteOnCallback)(uint8_t channel, uint8_t note, uint8_t velocity);
 typedef void (*NoteOffCallback)(uint8_t channel, uint8_t note);
 
-void play_midi(TrackData* tracks, int track_count, uint16_t time_div,
-               NoteOnCallback note_on_callback, NoteOffCallback note_off_callback) {
+void play_midi(
+    TrackData* tracks,
+    const int track_count,
+    const uint16_t time_div,
+    const SendDirectDataFunc SendDirectData,
+    const NoteOnCallback note_on_callback,
+    const NoteOffCallback note_off_callback
+) {
     uint64_t tick = 0;
     double multiplier = 0;
-    uint64_t bpm = 500000; // Default tempo: 120 BPM
+    uint64_t bpm = 500000;
     uint64_t delta_tick = 0;
-    uint64_t last_time = 0;
+    uint64_t last_time = get100NanosecondsSinceEpoch();
     const uint64_t max_drift = 100000;
     int64_t delta = 0;
     uint64_t old = 0;
@@ -194,21 +200,15 @@ void play_midi(TrackData* tracks, int track_count, uint16_t time_div,
     uint64_t note_on_count = 0;
     bool is_playing = true;
 
-    uint64_t now = get100NanosecondsSinceEpoch();
-    last_time = now;
-
-    // Setup and start logger thread
     pthread_t logger_thread;
     LoggerArgs* logger_args = malloc(sizeof(LoggerArgs));
     logger_args->is_playing = &is_playing;
     logger_args->note_on_count = &note_on_count;
-
     pthread_create(&logger_thread, NULL, log_notes_per_second, logger_args);
 
     bool has_active_tracks = true;
 
     while (has_active_tracks) {
-        // Check if there are any active tracks
         has_active_tracks = false;
         int active_track_count = 0;
         int* active_tracks = malloc(track_count * sizeof(int));
@@ -216,36 +216,33 @@ void play_midi(TrackData* tracks, int track_count, uint16_t time_div,
         for (int i = 0; i < track_count; i++) {
             if (tracks[i].data != NULL) {
                 if (tracks[i].tick <= tick) {
-                    // Process events in this track
                     while (tracks[i].data != NULL && tracks[i].tick <= tick) {
                         update_command(&tracks[i]);
                         update_message(&tracks[i]);
 
                         const uint32_t message = tracks[i].message;
-                        const uint8_t status_byte = message & 0xFF;
-                        const uint8_t channel = status_byte & 0x0F;
-                        const uint8_t command = status_byte & 0xF0;
-                        const uint8_t note = (message >> 8) & 0xFF;
-                        const uint8_t velocity = (message >> 16) & 0xFF;
+                        const uint8_t msg_type = message & 0xF0;
+                        const uint8_t channel = message & 0x0F;
 
-                        if (command == 0x90) { // Note On
-                            note_on_count++;
-                            if (velocity > 0) {
-                                if (note_on_callback) {
-                                    note_on_callback(velocity, channel, note);
+                        if (msg_type < 0xF0) {
+                            const uint8_t note = (message >> 8) & 0xFF;
+                            const uint8_t velocity = (message >> 16) & 0xFF;
+
+                            if (msg_type == 0x90) {  // Note On
+                                note_on_count++;
+                                if (note_on_callback) note_on_callback(channel, note, velocity);
+                                if (velocity >= 5) {
+                                    SendDirectData(message);
                                 }
+                            } else if (msg_type == 0x80 || (msg_type == 0x90 && velocity == 0)) {  // Note Off
+                                if (note_off_callback) note_off_callback(channel, note);
+                                SendDirectData(message);
                             } else {
-                                if (note_off_callback) {
-                                    note_off_callback(channel, note);
-                                }
+                                SendDirectData(message);
                             }
-                        } else if (command == 0x80) { // Note Off
-                            if (note_off_callback) {
-                                note_off_callback(channel, note);
-                            }
-                        } else if (status_byte == 0xFF) {
+                        } else if ((message & 0xFF) == 0xFF) {
                             process_meta_event(&tracks[i], &multiplier, &bpm, time_div);
-                        } else if (status_byte == 0xF0) {
+                        } else if ((message & 0xFF) == 0xF0) {
                             printf("TODO: Handle SysEx\n");
                         }
 
@@ -267,7 +264,6 @@ void play_midi(TrackData* tracks, int track_count, uint16_t time_div,
             break;
         }
 
-        // Find next tick
         delta_tick = UINT64_MAX;
         for (int i = 0; i < active_track_count; i++) {
             int idx = active_tracks[i];
@@ -283,7 +279,7 @@ void play_midi(TrackData* tracks, int track_count, uint16_t time_div,
 
         tick += delta_tick;
 
-        now = get100NanosecondsSinceEpoch();
+        const uint64_t now = get100NanosecondsSinceEpoch();
         temp = now - last_time;
         last_time = now;
         temp -= old;
@@ -469,45 +465,41 @@ void* initialize_midi(SendDirectDataFunc* SendDirectData) {
         return midi_lib;
 }
 
-// int main(const int argc, char* argv[]) {
-//     if (argc < 2) {
-//         fprintf(stderr, "Usage: %s <midi_file>\n", argv[0]);
-//         return 1;
-//     }
-//
-//     // Initialize MIDI
-//     SendDirectDataFunc SendDirectData;
-//     const clock_t start_time = clock();
-//
-//     void* midi_lib = initialize_midi(&SendDirectData);
-//     if (!midi_lib) {
-//         return 1;
-//     }
-//
-//     // Load MIDI file
-//     uint16_t time_div = 0;
-//     int track_count = 0;
-//     TrackData* tracks = load_midi_file(argv[1], &time_div, &track_count);
-//     if (!tracks) {
-//         dlclose(midi_lib);
-//         return 1;
-//     }
-//
-//     const clock_t end_time = clock();
-//     const double duration_seconds = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-//     const long duration_milliseconds = (long)(duration_seconds * 1000);
-//
-//     printf("MIDI initialization took %ldms.\n", duration_milliseconds);
-//     printf("\n\n\nPlaying midi file: %s\n", argv[1]);
-//
-//     play_midi(tracks, track_count, time_div, SendDirectData);
-//
-//     // Clean up
-//     for (int i = 0; i < track_count; i++) {
-//         free_track_data(&tracks[i]);
-//     }
-//     free(tracks);
-//     dlclose(midi_lib);
-//
-//     return 0;
-// }
+bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCallback note_off_callback)
+{
+    // Initialize MIDI
+    SendDirectDataFunc SendDirectData;
+    const clock_t start_time = clock();
+
+    void* midi_lib = initialize_midi(&SendDirectData);
+    if (!midi_lib) {
+        return 1;
+    }
+
+    // Load MIDI file
+    uint16_t time_div = 0;
+    int track_count = 0;
+    TrackData* tracks = load_midi_file(file, &time_div, &track_count);
+    if (!tracks) {
+        dlclose(midi_lib);
+        return 1;
+    }
+
+    const clock_t end_time = clock();
+    const double duration_seconds = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    const long duration_milliseconds = (long)(duration_seconds * 1000);
+
+    printf("MIDI initialization took %ldms.\n", duration_milliseconds);
+    printf("\n\n\nPlaying midi file: %s\n", file);
+
+    play_midi(tracks, track_count, time_div, SendDirectData, note_on_callback, note_off_callback);
+
+    // Clean up
+    for (int i = 0; i < track_count; i++) {
+        free_track_data(&tracks[i]);
+    }
+    free(tracks);
+    dlclose(midi_lib);
+
+    return 0;
+}
