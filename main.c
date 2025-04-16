@@ -12,7 +12,7 @@
 #define MAX_KEYS 128
 #define FLASH_DURATION 0.15f
 
-#define RING_BUFFER_SIZE 8192
+#define RING_BUFFER_SIZE 134140649
 typedef struct {
     uint8_t note;
     uint8_t velocity;
@@ -46,7 +46,7 @@ static EventQueue eventQueue = {0};
 static NoteArray activeNotes = {0};
 static double globalTime = 0.0;
 static double timeOffset = 0.0;
-static float scrollSpeed = 200.0f;
+static float scrollSpeed = 500.0f;
 static RenderTexture2D pianoRollTexture;
 static bool textureNeedsUpdate = true;
 static int screenWidth = 1600;
@@ -60,7 +60,7 @@ static void init_event_queue() {
     pthread_mutex_init(&eventQueue.mutex, NULL);
 }
 
-static bool queue_push(MidiEvent event) {
+inline __attribute__((always_inline)) static bool queue_push(MidiEvent event) {
     bool success = false;
     pthread_mutex_lock(&eventQueue.mutex);
     int next = (eventQueue.head + 1) % RING_BUFFER_SIZE;
@@ -73,7 +73,7 @@ static bool queue_push(MidiEvent event) {
     return success;
 }
 
-static bool queue_pop(MidiEvent* event) {
+inline __attribute__((always_inline)) static bool queue_pop(MidiEvent* event) {
     bool success = false;
     pthread_mutex_lock(&eventQueue.mutex);
     if (eventQueue.tail != eventQueue.head) {
@@ -85,27 +85,27 @@ static bool queue_pop(MidiEvent* event) {
     return success;
 }
 
-static void init_note_array() {
+inline __attribute__((always_inline)) static void init_note_array() {
     activeNotes.capacity = 1024;
     activeNotes.count = 0;
     activeNotes.notes = (NoteEvent*)malloc(sizeof(NoteEvent) * activeNotes.capacity);
 }
 
-static void ensure_note_capacity() {
+inline __attribute__((always_inline)) static void ensure_note_capacity() {
     if (activeNotes.count >= activeNotes.capacity) {
         activeNotes.capacity *= 2;
         activeNotes.notes = (NoteEvent*)realloc(activeNotes.notes, sizeof(NoteEvent) * activeNotes.capacity);
     }
 }
 
-static inline float get_note_y_piano(uint8_t note) {
+inline __attribute__((always_inline)) static float get_note_y_piano(uint8_t note) {
     return screenHeight - ((float)(note + 1) / MAX_KEYS) * screenHeight;
 }
-static inline float get_note_y(uint8_t note) {
+inline __attribute__((always_inline)) static float get_note_y(uint8_t note) {
     return ((float)(note + 1) / MAX_KEYS) * screenHeight;
 }
 
-void note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
+inline __attribute__((always_inline)) static void note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
     MidiEvent event = {
         .note = note,
         .velocity = velocity,
@@ -115,7 +115,7 @@ void note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
     queue_push(event);
 }
 
-void note_off(uint8_t channel, uint8_t note) {
+inline __attribute__((always_inline)) static void note_off(uint8_t channel, uint8_t note) {
     MidiEvent event = {
         .note = note,
         .velocity = 0,
@@ -125,7 +125,7 @@ void note_off(uint8_t channel, uint8_t note) {
     queue_push(event);
 }
 
-static void process_midi_events() {
+inline __attribute__((always_inline)) static void process_midi_events() {
     MidiEvent event;
     while (queue_pop(&event)) {
         if (event.isNoteOn) {
@@ -156,7 +156,7 @@ static void process_midi_events() {
 
 #define MAX_RENDERED_NOTES 300000
 
-static void cleanup_notes() {
+inline __attribute__((always_inline)) static void cleanup_notes() {
     double cutoffTime = globalTime - (screenWidth / scrollSpeed);
     int writeIndex = 0;
 
@@ -185,7 +185,7 @@ static void cleanup_notes() {
     }
 }
 
-static void update_texture() {
+inline __attribute__((always_inline)) static void update_texture() {
     double currentTime = GetTime() - timeOffset;
     if (!textureNeedsUpdate && (currentTime - lastRenderTime < renderInterval)) {
         return;
