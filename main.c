@@ -12,7 +12,7 @@
 #define MAX_KEYS 128
 #define FLASH_DURATION 0.15f
 
-#define RING_BUFFER_SIZE 134140649
+#define RING_BUFFER_SIZE 134140400
 typedef struct {
     uint8_t note;
     uint8_t velocity;
@@ -54,13 +54,16 @@ static int screenHeight = 900;
 static double lastRenderTime = 0.0;
 static double renderInterval = 1.0 / 144.0;
 
+// static uint64_t* notesPerSecond = 0;
+static uint64_t notesPerSecond = 0;
+
 static void init_event_queue() {
     eventQueue.head = 0;
     eventQueue.tail = 0;
     pthread_mutex_init(&eventQueue.mutex, NULL);
 }
 
-inline __attribute__((always_inline)) static bool queue_push(MidiEvent event) {
+inline __attribute__((always_inline)) static bool queue_push(const MidiEvent event) {
     bool success = false;
     pthread_mutex_lock(&eventQueue.mutex);
     int next = (eventQueue.head + 1) % RING_BUFFER_SIZE;
@@ -98,14 +101,14 @@ inline __attribute__((always_inline)) static void ensure_note_capacity() {
     }
 }
 
-inline __attribute__((always_inline)) static float get_note_y_piano(uint8_t note) {
+inline __attribute__((always_inline)) static float get_note_y_piano(const uint8_t note) {
     return screenHeight - ((float)(note + 1) / MAX_KEYS) * screenHeight;
 }
-inline __attribute__((always_inline)) static float get_note_y(uint8_t note) {
+inline __attribute__((always_inline)) static float get_note_y(const uint8_t note) {
     return ((float)(note + 1) / MAX_KEYS) * screenHeight;
 }
 
-inline __attribute__((always_inline)) static void note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
+inline __attribute__((always_inline)) static void note_on(uint8_t channel, const uint8_t note, const uint8_t velocity) {
     MidiEvent event = {
         .note = note,
         .velocity = velocity,
@@ -115,7 +118,7 @@ inline __attribute__((always_inline)) static void note_on(uint8_t channel, uint8
     queue_push(event);
 }
 
-inline __attribute__((always_inline)) static void note_off(uint8_t channel, uint8_t note) {
+inline __attribute__((always_inline)) static void note_off(uint8_t channel, const uint8_t note) {
     MidiEvent event = {
         .note = note,
         .velocity = 0,
@@ -124,6 +127,16 @@ inline __attribute__((always_inline)) static void note_off(uint8_t channel, uint
     };
     queue_push(event);
 }
+
+// static void notes_per_second(uint64_t* note_per_second)
+// {
+//     notesPerSecond = note_per_second;
+// }
+void notes_per_second(uint64_t nps) {
+    notesPerSecond = nps;
+    printf("Renderer got: %lu\n", nps);
+}
+
 
 inline __attribute__((always_inline)) static void process_midi_events() {
     MidiEvent event;
@@ -157,7 +170,7 @@ inline __attribute__((always_inline)) static void process_midi_events() {
 #define MAX_RENDERED_NOTES 300000
 
 inline __attribute__((always_inline)) static void cleanup_notes() {
-    double cutoffTime = globalTime - (screenWidth / scrollSpeed);
+    const double cutoffTime = globalTime - (screenWidth / scrollSpeed);
     int writeIndex = 0;
 
     // First pass: remove notes that ended too early
@@ -186,7 +199,7 @@ inline __attribute__((always_inline)) static void cleanup_notes() {
 }
 
 inline __attribute__((always_inline)) static void update_texture() {
-    double currentTime = GetTime() - timeOffset;
+    const double currentTime = GetTime() - timeOffset;
     if (!textureNeedsUpdate && (currentTime - lastRenderTime < renderInterval)) {
         return;
     }
@@ -204,14 +217,14 @@ inline __attribute__((always_inline)) static void update_texture() {
     }
 
     for (int i = 0; i < activeNotes.count; i++) {
-        NoteEvent* ev = &activeNotes.notes[i];
-        float duration = (ev->endTime >= 0.0) ? (ev->endTime - ev->startTime) : (globalTime - ev->startTime);
-        float x = (ev->startTime - (globalTime - screenWidth / scrollSpeed)) * scrollSpeed;
-        float width = duration * scrollSpeed;
-        float y = get_note_y(ev->note);
+        const NoteEvent* ev = &activeNotes.notes[i];
+        const float duration = (ev->endTime >= 0.0) ? (ev->endTime - ev->startTime) : (globalTime - ev->startTime);
+        const float x = (ev->startTime - (globalTime - screenWidth / scrollSpeed)) * scrollSpeed;
+        const float width = duration * scrollSpeed;
+        const float y = get_note_y(ev->note);
         if (x + width < 0 || x > screenWidth) continue;
-        float intensity = ev->velocity / 127.0f;
-        Color color = (Color){ (int)(intensity * 255), 64, 255, 255 };
+        const float intensity = ev->velocity / 127.0f;
+        const Color color = (Color){ (int)(intensity * 255), 64, 255, 255 };
         DrawRectangle(x, y - NOTE_HEIGHT, width, NOTE_HEIGHT, color);
     }
     EndTextureMode();
@@ -221,11 +234,11 @@ inline __attribute__((always_inline)) static void update_texture() {
 static void* midi_thread(void* arg) {
     char* midiPath = (char*)arg;
     timeOffset = GetTime();
-    PlayMIDI(midiPath, note_on, note_off);
+    PlayMIDI(midiPath, note_on, note_off, notes_per_second);
     return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(const int argc, char* argv[]) {
     if (argc < 2) {
         printf("Usage: %s <midi_file>\n", argv[0]);
         return 1;
@@ -242,8 +255,8 @@ int main(int argc, char* argv[]) {
     pthread_create(&midiThread, NULL, midi_thread, argv[1]);
 
     while (!WindowShouldClose()) {
-        double currentTime = GetTime() - timeOffset;
-        double deltaTime = currentTime - globalTime;
+        const double currentTime = GetTime() - timeOffset;
+        const double deltaTime = currentTime - globalTime;
         globalTime = currentTime;
 
         textureNeedsUpdate = true;
@@ -274,9 +287,9 @@ int main(int argc, char* argv[]) {
         DrawRectangle(screenWidth - keyboardWidth, 0, keyboardWidth, screenHeight, DARKGRAY);
 
         for (int note = 0; note < MAX_KEYS; note++) {
-            int noteType = note % 12;
-            float y = get_note_y(note);
-            bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
+            const int noteType = note % 12;
+            const float y = get_note_y(note);
+            const bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
             if (isBlackKey) {
                 DrawRectangle(screenWidth - keyboardWidth/2, y - NOTE_HEIGHT, keyboardWidth/2, NOTE_HEIGHT, BLACK);
             }
@@ -286,10 +299,10 @@ int main(int argc, char* argv[]) {
         }
 
         for (int i = 0; i < activeNotes.count; i++) {
-            NoteEvent* ev = &activeNotes.notes[i];
+            const NoteEvent* ev = &activeNotes.notes[i];
             if (ev->flashTimer > 0.0f) {
-                float y = get_note_y_piano(ev->note);
-                float alpha = ev->flashTimer / FLASH_DURATION;
+                const float y = get_note_y_piano(ev->note);
+                const float alpha = ev->flashTimer / FLASH_DURATION;
                 Color flashColor = WHITE;
                 flashColor.a = (unsigned char)(alpha * 255);
                 DrawRectangle(screenWidth - keyboardWidth, y - NOTE_HEIGHT, keyboardWidth, NOTE_HEIGHT, flashColor);
@@ -299,6 +312,7 @@ int main(int argc, char* argv[]) {
         DrawLine(screenWidth - keyboardWidth, 0, screenWidth - keyboardWidth, screenHeight, WHITE);
         DrawFPS(10, 10);
         DrawText(TextFormat("Notes: %d", activeNotes.count), 10, 30, 20, GREEN);
+        DrawText(TextFormat("NPS: %d", notesPerSecond), 10, 50, 20, SKYBLUE);
 
         EndDrawing();
     }

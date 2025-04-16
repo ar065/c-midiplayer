@@ -135,9 +135,12 @@ inline __attribute__((always_inline)) void process_meta_event(TrackData* track, 
     }
 }
 
+typedef void (*NotePerSecondCallback)(uint64_t note_per_second);
+
 typedef struct {
     bool* is_playing;
     uint64_t* note_on_count;
+    NotePerSecondCallback npsCallback;
 } LoggerArgs;
 
 void* log_notes_per_second(void* arg) {
@@ -149,6 +152,7 @@ void* log_notes_per_second(void* arg) {
         struct timespec sleep_time = {1, 0}; // 1 second
         nanosleep(&sleep_time, NULL);
         printf("Notes per second: %lu\n", *note_on_count);
+        args->npsCallback(*note_on_count);
         *note_on_count = 0;
     }
 
@@ -185,7 +189,8 @@ void play_midi(
     const uint16_t time_div,
     const SendDirectDataFunc SendDirectData,
     const NoteOnCallback note_on_callback,
-    const NoteOffCallback note_off_callback
+    const NoteOffCallback note_off_callback,
+    const NotePerSecondCallback note_per_second_callback
 ) {
     uint64_t tick = 0;
     double multiplier = 0;
@@ -204,6 +209,7 @@ void play_midi(
     LoggerArgs* logger_args = malloc(sizeof(LoggerArgs));
     logger_args->is_playing = &is_playing;
     logger_args->note_on_count = &note_on_count;
+    logger_args->npsCallback = note_per_second_callback;
     pthread_create(&logger_thread, NULL, log_notes_per_second, logger_args);
 
     bool has_active_tracks = true;
@@ -465,7 +471,7 @@ void* initialize_midi(SendDirectDataFunc* SendDirectData) {
         return midi_lib;
 }
 
-bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCallback note_off_callback)
+bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCallback note_off_callback, const NotePerSecondCallback note_per_second_callback)
 {
     // Initialize MIDI
     SendDirectDataFunc SendDirectData;
@@ -492,7 +498,7 @@ bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCa
     printf("MIDI initialization took %ldms.\n", duration_milliseconds);
     printf("\n\n\nPlaying midi file: %s\n", file);
 
-    play_midi(tracks, track_count, time_div, SendDirectData, note_on_callback, note_off_callback);
+    play_midi(tracks, track_count, time_div, SendDirectData, note_on_callback, note_off_callback, note_per_second_callback);
 
     // Clean up
     for (int i = 0; i < track_count; i++) {

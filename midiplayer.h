@@ -22,7 +22,9 @@ typedef struct {
 typedef void (*NoteOnCallback)(uint8_t channel, uint8_t note, uint8_t velocity);
 typedef void (*NoteOffCallback)(uint8_t channel, uint8_t note);
 
+typedef void (*NotePerSecondCallback)(uint64_t note_per_second);
+
 // Public function
-bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCallback note_off_callback);
+bool PlayMIDI(char* file, const NoteOnCallback note_on_callback, const NoteOffCallback note_off_callback, const NotePerSecondCallback note_per_second_callback);
 
 #endif
