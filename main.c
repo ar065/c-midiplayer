@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -10,15 +11,29 @@
 
 #define NOTE_HEIGHT 6
 #define MAX_KEYS 128
+#define MAX_CHANNELS 16
 #define FLASH_DURATION 0.15f
 
-#define RING_BUFFER_SIZE 134140400
+#define SCROLL_TEXTURE_WIDTH 6400  // Width of the scrolling texture buffer (in pixels)
+#define RING_BUFFER_SIZE 13414000
+
+#define CLEAR_WIDTH_MULTIPLIER 1.5f
+
 typedef struct {
     uint8_t note;
     uint8_t velocity;
+    uint8_t channel;
     bool isNoteOn;
     double timestamp;
 } MidiEvent;
+
+typedef struct {
+    bool isActive;
+    uint8_t velocity;
+    double startTime;
+    float startX;     // The X position where this note started
+    bool needsDrawing; // Flag to indicate if this note needs initial drawing
+} ActiveNote;
 
 typedef struct {
     MidiEvent events[RING_BUFFER_SIZE];
@@ -27,40 +42,40 @@ typedef struct {
     pthread_mutex_t mutex;
 } EventQueue;
 
-typedef struct {
-    uint8_t note;
-    double startTime;
-    double endTime;
-    uint8_t velocity;
-    bool active;
-    float flashTimer;
-} NoteEvent;
-
-typedef struct {
-    NoteEvent* notes;
-    int capacity;
-    int count;
-} NoteArray;
-
 static EventQueue eventQueue = {0};
-static NoteArray activeNotes = {0};
 static double globalTime = 0.0;
 static double timeOffset = 0.0;
-static float scrollSpeed = 500.0f;
-static RenderTexture2D pianoRollTexture;
-static bool textureNeedsUpdate = true;
+static float scrollSpeed = 500.0f; // pixels per second
+static RenderTexture2D scrollTexture;
+static bool textureNeedsUpdate = false;   // true when new events have arrived
 static int screenWidth = 1600;
 static int screenHeight = 900;
-static double lastRenderTime = 0.0;
-static double renderInterval = 1.0 / 144.0;
-
-// static uint64_t* notesPerSecond = 0;
 static uint64_t notesPerSecond = 0;
+static float scrollOffset = 0.0f;
+static double deltaTime = 0.0;
+static double previousDeltaTime = 0.0; // For smoothing
+
+// Track active notes per channel and note number
+static ActiveNote activeNotes[MAX_CHANNELS][MAX_KEYS] = {0};
+
+// We'll track the time up to which events have been drawn:
+static double drawnTime = 0.0;
+static double lastClearTime = 0.0;  // Track when we last cleared the texture
 
 static void init_event_queue() {
     eventQueue.head = 0;
     eventQueue.tail = 0;
     pthread_mutex_init(&eventQueue.mutex, NULL);
+
+    for (int c = 0; c < MAX_CHANNELS; c++) {
+        for (int n = 0; n < MAX_KEYS; n++) {
+            activeNotes[c][n].isActive = false;
+            activeNotes[c][n].velocity = 0;
+            activeNotes[c][n].startTime = 0.0;
+            activeNotes[c][n].startX = 0.0f;
+            activeNotes[c][n].needsDrawing = false;
+        }
+    }
 }
 
 inline __attribute__((always_inline)) static bool queue_push(const MidiEvent event) {
@@ -88,146 +103,183 @@ inline __attribute__((always_inline)) static bool queue_pop(MidiEvent* event) {
     return success;
 }
 
-inline __attribute__((always_inline)) static void init_note_array() {
-    activeNotes.capacity = 1024;
-    activeNotes.count = 0;
-    activeNotes.notes = (NoteEvent*)malloc(sizeof(NoteEvent) * activeNotes.capacity);
-}
-
-inline __attribute__((always_inline)) static void ensure_note_capacity() {
-    if (activeNotes.count >= activeNotes.capacity) {
-        activeNotes.capacity *= 2;
-        activeNotes.notes = (NoteEvent*)realloc(activeNotes.notes, sizeof(NoteEvent) * activeNotes.capacity);
-    }
-}
-
-inline __attribute__((always_inline)) static float get_note_y_piano(const uint8_t note) {
-    return screenHeight - ((float)(note + 1) / MAX_KEYS) * screenHeight;
-}
 inline __attribute__((always_inline)) static float get_note_y(const uint8_t note) {
     return ((float)(note + 1) / MAX_KEYS) * screenHeight;
+}
+
+inline __attribute__((always_inline)) static Color get_note_color(uint8_t channel) {
+    static const Color channelColors[MAX_CHANNELS] = {
+        RED, ORANGE, GOLD, GREEN, DARKGREEN, SKYBLUE, BLUE, DARKBLUE,
+        PURPLE, MAGENTA, MAROON, BROWN, PINK, DARKGRAY, RAYWHITE, WHITE
+    };
+    return channelColors[channel % MAX_CHANNELS];
 }
 
 inline __attribute__((always_inline)) static void note_on(uint8_t channel, const uint8_t note, const uint8_t velocity) {
     MidiEvent event = {
         .note = note,
         .velocity = velocity,
+        .channel = channel,
         .isNoteOn = true,
         .timestamp = GetTime() - timeOffset
     };
+
+    activeNotes[channel][note].isActive = true;
+    activeNotes[channel][note].velocity = velocity;
+    activeNotes[channel][note].startTime = event.timestamp;
+    activeNotes[channel][note].needsDrawing = true;  // Mark that this note needs initial drawing
+
     queue_push(event);
+    textureNeedsUpdate = true;
 }
 
 inline __attribute__((always_inline)) static void note_off(uint8_t channel, const uint8_t note) {
     MidiEvent event = {
         .note = note,
         .velocity = 0,
+        .channel = channel,
         .isNoteOn = false,
         .timestamp = GetTime() - timeOffset
     };
+
+    activeNotes[channel][note].isActive = false;
+    activeNotes[channel][note].needsDrawing = false;
+
     queue_push(event);
+    textureNeedsUpdate = true;
 }
 
-// static void notes_per_second(uint64_t* note_per_second)
-// {
-//     notesPerSecond = note_per_second;
-// }
 void notes_per_second(uint64_t nps) {
     notesPerSecond = nps;
     printf("Renderer got: %lu\n", nps);
 }
 
+// Apply smoothing to delta time to prevent stuttering
+inline __attribute__((always_inline)) static float smooth_delta_time(float dt) {
+    // Simple exponential smoothing
+    const float alpha = 0.2f;  // Smoothing factor (lower = more smoothing)
+    return alpha * dt + (1.0f - alpha) * previousDeltaTime;
+}
 
-inline __attribute__((always_inline)) static void process_midi_events() {
-    MidiEvent event;
-    while (queue_pop(&event)) {
-        if (event.isNoteOn) {
-            ensure_note_capacity();
-            NoteEvent newNote = {
-                .note = event.note,
-                .startTime = event.timestamp,
-                .endTime = -1.0,
-                .velocity = event.velocity,
-                .active = true,
-                .flashTimer = FLASH_DURATION
-            };
-            activeNotes.notes[activeNotes.count++] = newNote;
-            textureNeedsUpdate = true;
-        } else {
-            for (int i = activeNotes.count - 1; i >= 0; i--) {
-                if (activeNotes.notes[i].note == event.note && activeNotes.notes[i].active && activeNotes.notes[i].endTime < 0.0) {
-                    activeNotes.notes[i].endTime = event.timestamp;
-                    activeNotes.notes[i].active = false;
-                    textureNeedsUpdate = true;
-                    break;
+// Clear the portion of the texture that's scrolled off-screen
+inline __attribute__((always_inline)) static void clear_offscreen_texture() {
+    BeginTextureMode(scrollTexture);
+
+    // Calculate how much to clear based on time elapsed, with extra width to ensure all notes are cleared
+    float clearWidth = deltaTime * scrollSpeed * CLEAR_WIDTH_MULTIPLIER;
+
+    // Make sure we clear at least 5 pixels to avoid missing thin notes
+    if (clearWidth < 5.0f) clearWidth = 5.0f;
+
+    // Calculate the position to clear (just behind the current view)
+    float clearX = fmodf(scrollOffset - clearWidth, SCROLL_TEXTURE_WIDTH);
+    if (clearX < 0) clearX += SCROLL_TEXTURE_WIDTH;
+
+    // Clear that section with a little extra width to ensure complete clearing
+    DrawRectangle(clearX, 0, clearWidth + 5, screenHeight, BLACK);
+
+    // Also clear a small area at the texture wrap point if needed
+    if (clearX + clearWidth > SCROLL_TEXTURE_WIDTH) {
+        float wrapClearWidth = clearX + clearWidth - SCROLL_TEXTURE_WIDTH;
+        DrawRectangle(0, 0, wrapClearWidth + 5, screenHeight, BLACK);
+    }
+
+    EndTextureMode();
+    lastClearTime = globalTime;
+}
+
+// Draw/update actively sounding notes
+inline __attribute__((always_inline)) static void update_active_notes() {
+    BeginTextureMode(scrollTexture);
+
+    // Calculate the current right edge position in the texture
+    float currentRightEdge = fmodf(scrollOffset + screenWidth, SCROLL_TEXTURE_WIDTH);
+
+    // For each active note, extend it to the current time
+    for (int c = 0; c < MAX_CHANNELS; c++) {
+        for (int n = 0; n < MAX_KEYS; n++) {
+            if (activeNotes[c][n].isActive) {
+                float y = get_note_y(n);
+
+                if (activeNotes[c][n].needsDrawing) {
+                    activeNotes[c][n].startX = currentRightEdge;
+                    activeNotes[c][n].needsDrawing = false;
+                }
+
+                float startX = activeNotes[c][n].startX;
+
+                // Don't draw notes with invalid startX
+                // if (startX <= 0) continue;
+                if (startX < 0) startX = currentRightEdge;  // Default to now if missing
+
+                // Calculate the current note length in pixels
+                float endX = currentRightEdge;
+
+                // Handle wrap-around cases
+                if (endX < startX) {
+                    // First, draw from startX to end of texture
+                    DrawRectangle(startX, y - NOTE_HEIGHT, SCROLL_TEXTURE_WIDTH - startX, NOTE_HEIGHT,
+                        get_note_color(c));
+
+                    // Then draw from beginning of texture to endX
+                    DrawRectangle(0, y - NOTE_HEIGHT, endX, NOTE_HEIGHT,
+                        get_note_color(c));
+                } else {
+                    // Normal case (no wrap-around)
+                    DrawRectangle(startX, y - NOTE_HEIGHT, endX - startX, NOTE_HEIGHT,
+                        get_note_color(c));
                 }
             }
         }
     }
-}
 
-
-#define MAX_RENDERED_NOTES 300000
-
-inline __attribute__((always_inline)) static void cleanup_notes() {
-    const double cutoffTime = globalTime - (screenWidth / scrollSpeed);
-    int writeIndex = 0;
-
-    // First pass: remove notes that ended too early
-    for (int i = 0; i < activeNotes.count; i++) {
-        bool isOld = activeNotes.notes[i].endTime >= 0 && activeNotes.notes[i].endTime < cutoffTime;
-        if (!isOld) {
-            if (writeIndex != i) {
-                activeNotes.notes[writeIndex] = activeNotes.notes[i];
-            }
-            writeIndex++;
-        } else {
-            textureNeedsUpdate = true;
-        }
-    }
-    activeNotes.count = writeIndex;
-
-    // Second pass: trim oldest notes if we exceed the max count
-    if (activeNotes.count > MAX_RENDERED_NOTES) {
-        int extra = activeNotes.count - MAX_RENDERED_NOTES;
-
-        // Shift the remaining notes to remove the oldest ones
-        memmove(activeNotes.notes, activeNotes.notes + extra, sizeof(NoteEvent) * (activeNotes.count - extra));
-        activeNotes.count -= extra;
-        textureNeedsUpdate = true;
-    }
+    EndTextureMode();
 }
 
 inline __attribute__((always_inline)) static void update_texture() {
-    const double currentTime = GetTime() - timeOffset;
-    if (!textureNeedsUpdate && (currentTime - lastRenderTime < renderInterval)) {
-        return;
-    }
-    lastRenderTime = currentTime;
-    BeginTextureMode(pianoRollTexture);
-    ClearBackground(BLACK);
+    clear_offscreen_texture();
 
-    for (int octave = 0; octave < 11; octave++) {
-        int baseNote = octave * 12;
-        Color lineColor = (Color){ 30, 30, 30, 255 };
-        if (baseNote < MAX_KEYS) {
-            float y = get_note_y(baseNote);
-            DrawLine(0, y, screenWidth, y, lineColor);
+    float currentRightEdge = fmodf(scrollOffset + screenWidth, SCROLL_TEXTURE_WIDTH);
+
+    BeginTextureMode(scrollTexture);
+
+    MidiEvent event;
+    while (queue_pop(&event)) {
+        float y = get_note_y(event.note);
+
+        if (event.isNoteOn) {
+            activeNotes[event.channel][event.note].startX = currentRightEdge;
+            activeNotes[event.channel][event.note].needsDrawing = false; // We're handling it now
+        } else {
+            float startX = activeNotes[event.channel][event.note].startX;
+
+            // Only draw if we have a valid startX (might not if note_on was missed)
+            if (startX > 0) {
+                float endX = currentRightEdge;
+
+                Color noteColor = get_note_color(event.channel);
+
+                // Handle wrap-around cases
+                if (endX < startX) {
+                    // Draw from startX to end of texture
+                    DrawRectangle(startX, y - NOTE_HEIGHT, SCROLL_TEXTURE_WIDTH - startX, NOTE_HEIGHT, noteColor);
+
+                    // Draw from beginning of texture to endX
+                    DrawRectangle(0, y - NOTE_HEIGHT, endX, NOTE_HEIGHT, noteColor);
+                } else {
+                    // Normal case (no wrap-around)
+                    DrawRectangle(startX, y - NOTE_HEIGHT, endX - startX, NOTE_HEIGHT, noteColor);
+                }
+            }
         }
     }
 
-    for (int i = 0; i < activeNotes.count; i++) {
-        const NoteEvent* ev = &activeNotes.notes[i];
-        const float duration = (ev->endTime >= 0.0) ? (ev->endTime - ev->startTime) : (globalTime - ev->startTime);
-        const float x = (ev->startTime - (globalTime - screenWidth / scrollSpeed)) * scrollSpeed;
-        const float width = duration * scrollSpeed;
-        const float y = get_note_y(ev->note);
-        if (x + width < 0 || x > screenWidth) continue;
-        const float intensity = ev->velocity / 127.0f;
-        const Color color = (Color){ (int)(intensity * 255), 64, 255, 255 };
-        DrawRectangle(x, y - NOTE_HEIGHT, width, NOTE_HEIGHT, color);
-    }
     EndTextureMode();
+
+    // Update active notes (extend them to current time)
+    update_active_notes();
+
+    drawnTime = globalTime;
     textureNeedsUpdate = false;
 }
 
@@ -245,80 +297,79 @@ int main(const int argc, char* argv[]) {
     }
 
     init_event_queue();
-    init_note_array();
-
-    InitWindow(screenWidth, screenHeight, "Optimized MIDI Piano Roll");
+    InitWindow(screenWidth, screenHeight, "Refined MIDI Piano Roll");
     SetTargetFPS(144);
-    pianoRollTexture = LoadRenderTexture(screenWidth, screenHeight);
+
+    // Create a persistent scroll texture
+    scrollTexture = LoadRenderTexture(SCROLL_TEXTURE_WIDTH, screenHeight);
+    BeginTextureMode(scrollTexture);
+    ClearBackground(BLACK);
+    EndTextureMode();
 
     pthread_t midiThread;
     pthread_create(&midiThread, NULL, midi_thread, argv[1]);
 
+    double currentTime = GetTime() - timeOffset;
+    globalTime = currentTime;
+    lastClearTime = currentTime;
+    previousDeltaTime = 1.0 / 60.0;
+
     while (!WindowShouldClose()) {
-        const double currentTime = GetTime() - timeOffset;
-        const double deltaTime = currentTime - globalTime;
+        currentTime = GetTime() - timeOffset;
+        float rawDeltaTime = currentTime - globalTime;
+
+        // Apply smoothing to delta time to try to prevent stuttering
+        deltaTime = smooth_delta_time(rawDeltaTime);
+        previousDeltaTime = deltaTime; // Store for next frame's smoothing
+
         globalTime = currentTime;
 
-        textureNeedsUpdate = true;
-        process_midi_events();
-
-        // static double lastCleanup = 0;
-        // if (globalTime - lastCleanup > 1.0) {
-        //     cleanup_notes();
-        //     lastCleanup = globalTime;
-        // }
-        cleanup_notes();
-
-
+        // Always update the texture
         update_texture();
 
-        for (int i = 0; i < activeNotes.count; i++) {
-            if (activeNotes.notes[i].flashTimer > 0.0f) {
-                activeNotes.notes[i].flashTimer -= deltaTime;
-            }
+        // Advance the scroll offset - use smoothed delta time for consistent scrolling
+        scrollOffset += deltaTime * scrollSpeed;
+        if (scrollOffset >= SCROLL_TEXTURE_WIDTH) {
+            scrollOffset = fmodf(scrollOffset, SCROLL_TEXTURE_WIDTH);
         }
 
         BeginDrawing();
         ClearBackground(BLACK);
 
-        DrawTexture(pianoRollTexture.texture, 0, 0, WHITE);
+        // Draw the scroll texture as background
+        // Display from right to left
+        Rectangle source = { scrollOffset, 0, screenWidth, screenHeight };
+        Rectangle dest = { 0, 0, screenWidth, screenHeight };
+        DrawTexturePro(scrollTexture.texture, source, dest, (Vector2){ 0, 0 }, 0.0f, WHITE);
 
+        // Overlay a grid for the piano roll
+        for (int note = 0; note < MAX_KEYS; note++) {
+            float y = get_note_y(note);
+            Color lineColor = (note % 12 == 0) ? (Color){255, 255, 255, 255} : (Color){50, 50, 50, 255};
+            DrawLine(0, y, screenWidth, y, lineColor);
+        }
+
+        // Draw the piano keyboard on the side
         const int keyboardWidth = 40;
         DrawRectangle(screenWidth - keyboardWidth, 0, keyboardWidth, screenHeight, DARKGRAY);
-
         for (int note = 0; note < MAX_KEYS; note++) {
-            const int noteType = note % 12;
-            const float y = get_note_y(note);
-            const bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
+            int noteType = note % 12;
+            float y = get_note_y(note);
+            bool isBlackKey = (noteType == 1 || noteType == 3 || noteType == 6 || noteType == 8 || noteType == 10);
             if (isBlackKey) {
-                DrawRectangle(screenWidth - keyboardWidth/2, y - NOTE_HEIGHT, keyboardWidth/2, NOTE_HEIGHT, BLACK);
+                DrawRectangle(screenWidth - keyboardWidth / 2, y - NOTE_HEIGHT, keyboardWidth / 2, NOTE_HEIGHT, BLACK);
             }
             if (noteType == 0) {
-                DrawText(TextFormat("C%d", note/12 - 1), screenWidth - keyboardWidth + 2, y - NOTE_HEIGHT - 8, 10, GRAY);
+                DrawText(TextFormat("C%d", note / 12 - 1), screenWidth - keyboardWidth + 2, y - NOTE_HEIGHT - 8, 10, GRAY);
             }
         }
 
-        for (int i = 0; i < activeNotes.count; i++) {
-            const NoteEvent* ev = &activeNotes.notes[i];
-            if (ev->flashTimer > 0.0f) {
-                const float y = get_note_y_piano(ev->note);
-                const float alpha = ev->flashTimer / FLASH_DURATION;
-                Color flashColor = WHITE;
-                flashColor.a = (unsigned char)(alpha * 255);
-                DrawRectangle(screenWidth - keyboardWidth, y - NOTE_HEIGHT, keyboardWidth, NOTE_HEIGHT, flashColor);
-            }
-        }
-
-        DrawLine(screenWidth - keyboardWidth, 0, screenWidth - keyboardWidth, screenHeight, WHITE);
         DrawFPS(10, 10);
-        DrawText(TextFormat("Notes: %d", activeNotes.count), 10, 30, 20, GREEN);
-        DrawText(TextFormat("NPS: %d", notesPerSecond), 10, 50, 20, SKYBLUE);
-
+        DrawText(TextFormat("Notes per second: %lu", notesPerSecond), 10, 30, 20, WHITE);
         EndDrawing();
     }
 
-    UnloadRenderTexture(pianoRollTexture);
-    free(activeNotes.notes);
+    UnloadRenderTexture(scrollTexture);
     CloseWindow();
     return 0;
 }
