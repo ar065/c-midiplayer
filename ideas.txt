@@ -1,0 +1,2 @@
+1. midiplayer buffer; give the player time to think for maybe 10 seconds. timing will be hard but it can be done 
+2. renderer buffer; self explanitory. render notes way before they need to play. this will be inline with the time of the midi player buffer
